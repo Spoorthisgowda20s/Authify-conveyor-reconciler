@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Conveyor count reconciler</title>
+<style>
+  body { font: 14px/1.4 system-ui, sans-serif; margin: 12px 16px; color: #1b1b1b; background: #fafafa; }
+  h1 { font-size: 18px; margin: 0 0 8px; } h2 { font-size: 14px; margin: 14px 0 4px; }
+  fieldset { border: 1px solid #ccc; padding: 6px 10px; margin: 0 0 8px; display: inline-block; vertical-align: top; }
+  legend { font-weight: 600; font-size: 12px; }
+  input[type=number] { width: 70px; } button { padding: 3px 9px; cursor: pointer; }
+  .views { display: flex; gap: 8px; flex-wrap: wrap; } .views > div { flex: 1 1 480px; min-width: 0; }
+  canvas { width: 100%; image-rendering: pixelated; background: #000; border: 1px solid #888; display: block; }
+  table { border-collapse: collapse; } td, th { border: 1px solid #ccc; padding: 2px 8px; text-align: right; } th { background: #eee; }
+  td.l, th.l { text-align: left; }
+  .bad { color: #b00020; font-weight: 600; } .good { color: #1a7f37; font-weight: 600; }
+  #bar { height: 10px; background: #ddd; width: 260px; display: inline-block; vertical-align: middle; }
+  #bar i { display: block; height: 100%; background: #2a7; width: 0; }
+  .strip { display: flex; gap: 4px; } .strip canvas { cursor: pointer; } .strip figure { margin: 0; flex: 1; } .strip figcaption { font-size: 11px; text-align: center; }
+  .small { font-size: 12px; color: #555; } #log { font: 11px monospace; white-space: pre-wrap; color: #555; max-height: 70px; overflow: auto; }
+  .row { margin: 6px 0; } .sw { display: inline-block; width: 11px; height: 11px; vertical-align: middle; margin: 0 3px 0 8px; border: 1px solid #555; }
+</style>
+</head>
+<body>
+<div id="nofile" style="display:none;background:#fff3cd;border:2px solid #e0a800;padding:10px 14px;margin-bottom:10px">
+<b>This page must be opened through the server, not as a file.</b> In a terminal, inside the project folder, run
+<code>./start.sh</code> (or <code>python3 run.py</code>), wait for "running at http://127.0.0.1:8000/", then open
+<b>http://127.0.0.1:8000/</b> in your browser.</div>
+<h1>Conveyor count reconciler <span class="small" id="runname"></span></h1>
+<div id="nofile" style="display:none;background:#fde8e8;border:1px solid #b00020;padding:8px;margin-bottom:8px">
+  This page was opened as a file, so there is no server behind it and nothing can load.
+  Run <b>start.bat</b> (Windows) or <b>./start.sh</b> (Mac/Linux), wait for "running at http://127.0.0.1:8000/", then open <b>http://127.0.0.1:8000/</b> in the browser.</div>
+
+<div>
+<fieldset><legend>Drive the system</legend>
+  seed <input id="seed" type="number" value="1" min="1"> duration (s) <input id="dur" type="number" value="300" min="60" step="30">
+  stride <input id="stride" type="number" value="1" min="1" max="12" title="process every n-th frame">
+  run name <input id="runin" type="text" value="default" size="10">
+  <button id="bgen">Generate video + track + score</button>
+  <button id="btrk">Re-run tracker + score only</button>
+  <div class="row"><span id="stage" class="small">idle</span> <span id="bar"><i></i></span> <span id="log"></span></div>
+</fieldset>
+<fieldset><legend>Dataset</legend><select id="runsel"></select></fieldset>
+</div>
+
+<div id="main" style="display:none">
+<h2>Count vs ground truth</h2>
+<table id="tot"></table>
+
+<h2>Review (input left, tracker decision right)</h2>
+<div class="row">
+  <button id="b-10">⏮ −10</button><button id="b-1">◀ −1</button><button id="bplay">▶ Play</button><button id="b+1">+1 ▶</button><button id="b+10">+10 ⏭</button>
+  speed <select id="spd"><option value="1">1×</option><option value="0.25">¼×</option><option value="0.5">½×</option><option value="2">2×</option><option value="4">4×</option></select>
+  <input id="slider" type="range" min="0" max="0" value="0" style="width:340px; vertical-align:middle">
+  frame <b id="fno">0</b> / <span id="ftot"></span> (<span id="ftime"></span> s) belt v = <b id="fv"></b> px/frame
+</div>
+<div class="row">
+  jump to
+  <select id="jkind"><option value="count">next count event</option><option value="overlap">next ground-truth overlap</option><option value="stall">next belt stall</option><option value="bad">next wrong result (missed / double / id switch)</option></select>
+  <button id="jprev">◀ prev</button><button id="jnext">next ▶</button>
+  <label><input type="checkbox" id="o-gt"> ground-truth boxes</label>
+  <label><input type="checkbox" id="o-pred" checked> predicted box (dashed)</label>
+  <label><input type="checkbox" id="o-blob"> detected blobs</label>
+  <span class="small">keys: ← → step, space play</span>
+</div>
+<div class="views">
+  <div><canvas id="cin" width="640" height="200"></canvas><div class="small">input frame</div></div>
+  <div><canvas id="cout" width="640" height="200"></canvas>
+  <div class="small">tracked:
+    <span class="sw" style="background:#2c2"></span>matched (blob = this parcel)
+    <span class="sw" style="background:#f90"></span>merged (shares a blob; coasting on belt speed)
+    <span class="sw" style="background:#e22"></span>missed (no blob)
+    <span class="sw" style="background:#cc3"></span>tentative
+    <span class="sw" style="background:#0cf"></span>count line; ✓ = already counted; S/M/L = size bucket</div></div>
+</div>
+<h2>Contact sheet: frames around the current one (click to jump)</h2>
+<div class="strip" id="strip"></div>
+<div class="row">sheet spacing <select id="sstep"><option>1</option><option selected>2</option><option>3</option><option>5</option></select> frames</div>
+
+<div class="views">
+ <div><h2>At this frame</h2>
+  <table id="cnt"></table>
+  <h2>Tracks</h2><table id="trk"></table>
+ </div>
+ <div><h2>Count error over time (pipeline − truth, cumulative)</h2>
+  <canvas id="cchart" width="640" height="150" style="cursor:pointer;background:#fff"></canvas>
+  <div class="small">grey band = surge, red band = belt stalled, ticks = wrong results. Click to seek.</div>
+  <h2>Size buckets (rows truth, columns estimate, parcels counted exactly once)</h2><table id="conf"></table>
+ </div>
+</div>
+</div>
+<div id="empty" class="small">No data yet (or the server is not running: start it with ./start.sh). The first start generates and processes the default video (about a minute). Progress is shown above.</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const BN = ['small', 'medium', 'large'], BL = ['S', 'M', 'L'];
+let run = 'default', meta = null, M = null, N = 0, FPS = 30, cur = 0, playing = false, timer = null;
+const tracks = new Map(), gts = new Map(), CH = 300, loadedChunks = new Set(), imgs = new Map();
+let sortedTrackFrames = [];
+let cuts = [1300, 2900];
+
+async function api(path, opt) { const r = await fetch(path, opt); if (!r.ok) throw new Error(path + ' ' + r.status); return r.json(); }
+
+async function poll() {
+  try {
+    const s = await api('/api/state?run=' + encodeURIComponent($('runsel').value || ''));
+    const j = s.job;
+    $('stage').textContent = j.state === 'running' ? `running: ${j.stage} (${Math.round(j.progress * 100)}%)` :
+      j.state === 'error' ? 'ERROR: ' + j.error : j.state === 'done' ? 'finished' : 'idle';
+    $('bar').firstElementChild.style.width = (j.progress * 100) + '%';
+    $('log').textContent = (j.log || []).slice(-3).join('\n');
+    $('bgen').disabled = $('btrk').disabled = j.state === 'running';
+    const sel = $('runsel');
+    if (JSON.stringify(s.runs) !== sel.dataset.runs) {
+      sel.dataset.runs = JSON.stringify(s.runs); sel.innerHTML = s.runs.map(r => `<option ${r === s.run ? 'selected' : ''}>${r}</option>`).join('');
+    }
+    if (s.has_metrics && j.state !== 'running' && (run !== s.run || !M || j.state === 'done' && sel.dataset.loaded !== String(j.started))) {
+      sel.dataset.loaded = String(j.started); run = s.run; await loadRun();
+    }
+  } catch (e) { $('stage').textContent = 'server unreachable'; }
+  setTimeout(poll, 1000);
+}
+
+async function loadRun() {
+  tracks.clear(); gts.clear(); loadedChunks.clear(); imgs.clear();
+  meta = await api('/api/meta?run=' + run); M = await api('/api/metrics?run=' + run);
+  N = meta.gt.frames; FPS = meta.calibration.fps; cuts = M.config.bucket_cuts; cur = Math.min(cur, N - 1);
+  $('runname').textContent = '— run "' + run + '", seed ' + meta.gt.seed + ', stride ' + M.config.stride;
+  $('slider').max = N - 1; $('ftot').textContent = N; $('main').style.display = ''; $('empty').style.display = 'none';
+  buildTotals(); buildConf(); buildJumps(); drawChart(); await goto(cur);
+}
+
+function pct(x) { return (x >= 0 ? '+' : '') + x.toFixed(2) + '%'; }
+function cls(x) { return Math.abs(x) <= 2 ? 'good' : 'bad'; }
+function buildTotals() {
+  const t = M.total, s = M.steady, u = M.surge, st = M.stall, o = M.occluded_3plus_frames, h = M.heavily_occluded_vis_le_30pct;
+  const row = (n, x) => `<tr><td class="l">${n}</td><td>${x.gt}</td><td>${x.counted}</td><td class="${cls(x.error_pct)}">${pct(x.error_pct)}</td><td>${x.exactly_once}</td><td>${x.missed}</td><td>${x.double_counted}</td><td>${x.spurious}</td></tr>`;
+  $('tot').innerHTML = `<tr><th class="l"></th><th>true</th><th>counted</th><th>error</th><th>exactly once</th><th>missed</th><th>double</th><th>spurious</th></tr>` +
+    row('whole video', t) + row('steady stretches', s) + row('surges', u) +
+    `<tr><td class="l">belt stalled (${st.frames_stopped} frames)</td><td colspan="2">count events during stall</td><td class="${st.count_events_during_stall ? 'bad' : 'good'}">${st.count_events_during_stall}</td><td colspan="4"></td></tr>` +
+    `<tr><td class="l">parcels covered ≥3 frames</td><td>${o.parcels}</td><td colspan="2">counted exactly once</td><td>${o.exactly_once_pct}%</td><td>${o.missed}</td><td>${o.double_counted}</td><td></td></tr>` +
+    `<tr><td class="l">≥70% covered at some point</td><td>${h.parcels}</td><td colspan="2">counted exactly once</td><td>${h.exactly_once_pct}%</td><td>${h.missed}</td><td>${h.double_counted}</td><td></td></tr>` +
+    `<tr><td class="l" colspan="8" style="text-align:left" class="small">identity switches ${M.identity.id_switches}; buckets right for ${M.buckets.accuracy_pct}% of counted parcels; ${M.timing.track_ms_per_processed} ms tracking + ${M.timing.decode_ms_per_processed} ms decode per processed frame (${M.timing.realtime_factor}× real time)</td></tr>`;
+}
+function buildConf() {
+  const c = M.buckets.confusion_rows_truth_cols_pred;
+  $('conf').innerHTML = '<tr><th></th>' + BN.map(b => `<th>${b}</th>`).join('') + '</tr>' + c.map((r, i) => `<tr><td class="l">${BN[i]}</td>${r.map((v, j) => `<td ${i === j ? 'style="background:#e6f4ea"' : ''}>${v}</td>`).join('')}</tr>`).join('');
+}
+
+// ---- jump lists
+let jumps = {};
+function buildJumps() {
+  jumps.count = M.count_events.map(e => e[0]);
+  jumps.overlap = M.overlaps.map(o => Math.max(0, o.frame)).sort((a, b) => a - b);
+  jumps.stall = M.gt_stalls.map(s => s[0] - 10);
+  jumps.bad = M.discrepancies.map(d => Math.max(0, d.frame - 12)).sort((a, b) => a - b);
+}
+function jump(dir) {
+  const l = jumps[$('jkind').value] || []; let t = null;
+  if (dir > 0) t = l.find(f => f > cur + 1); else for (let i = l.length - 1; i >= 0; i--) if (l[i] < cur - 1) { t = l[i]; break; }
+  if (t !== null && t !== undefined) goto(t);
+}
+
+// ---- data loading
+async function ensureChunk(f) {
+  const c = Math.floor(f / CH); if (loadedChunks.has(c)) return; loadedChunks.add(c);
+  const a = c * CH, b = a + CH;
+  try {
+    const [t, g] = await Promise.all([api(`/api/tracks?run=${run}&start=${a}&end=${b}`), api(`/api/gt?run=${run}&start=${a}&end=${b}`)]);
+    t.forEach(r => tracks.set(r.f, r)); g.forEach((r, i) => gts.set(a + i, r));
+  } catch (e) { loadedChunks.delete(c); }
+}
+function trackAt(f) { for (let k = 0; k < 12; k++) { const r = tracks.get(f - k); if (r) return r; } return null; }
+function img(f) {
+  if (imgs.has(f)) return imgs.get(f);
+  const p = new Promise(res => { const i = new Image(); i.onload = () => res(i); i.src = `/api/frame?run=${run}&i=${f}`; });
+  imgs.set(f, p); if (imgs.size > 300) imgs.delete(imgs.keys().next().value); return p;
+}
+
+// ---- drawing
+function bucketOf(w, h) { const e = M.config.edge_bias || 0, a = (w - e) * (h - e); return a < cuts[0] ? 0 : a < cuts[1] ? 1 : 2; }
+const COL = ['#2c2', '#f90', '#e22', '#cc3'];
+function overlay(ctx, rec, gt, sc) {
+  const L = meta.calibration.count_line_x * sc;
+  ctx.strokeStyle = '#0cf'; ctx.lineWidth = 1; ctx.setLineDash([4, 3]); ctx.beginPath(); ctx.moveTo(L, 0); ctx.lineTo(L, ctx.canvas.height); ctx.stroke(); ctx.setLineDash([]);
+  if ($('o-blob').checked && rec) { ctx.strokeStyle = 'rgba(200,200,200,.7)'; rec.bl.forEach(b => ctx.strokeRect(b[0] * sc, b[1] * sc, b[2] * sc, b[3] * sc)); }
+  if ($('o-gt').checked && gt) { ctx.lineWidth = 1; ctx.font = (9 * Math.max(sc, .8)) + 'px sans-serif'; gt.forEach(g => { ctx.strokeStyle = '#f0f'; ctx.fillStyle = '#f0f'; ctx.strokeRect(g[1] * sc, g[2] * sc, g[3] * sc, g[4] * sc); ctx.fillText('gt' + g[0] + ' ' + Math.round(g[5] * 100) + '%', g[1] * sc, (g[2] + g[4]) * sc + 9); }); }
+  if (!rec) return;
+  if ($('o-pred').checked) { ctx.strokeStyle = 'rgba(255,255,255,.85)'; ctx.setLineDash([3, 3]); rec.pr.forEach(p => ctx.strokeRect(p[1] * sc, p[2] * sc, p[3] * sc, p[4] * sc)); ctx.setLineDash([]); }
+  ctx.lineWidth = 2;
+  rec.tr.forEach(t => {
+    const col = COL[t[5]]; ctx.strokeStyle = col; if (t[5] === 2) ctx.setLineDash([5, 3]);
+    ctx.strokeRect(t[1] * sc, t[2] * sc, t[3] * sc, t[4] * sc); ctx.setLineDash([]);
+    ctx.fillStyle = col; ctx.font = 'bold ' + Math.max(9, 11 * sc) + 'px sans-serif';
+    ctx.fillText('#' + t[0] + (t[5] === 3 ? '' : ' ' + BL[bucketOf(t[3], t[4])]) + (t[6] ? ' ✓' : ''), t[1] * sc + 2, t[2] * sc + 11 * Math.max(sc, .85));
+  });
+}
+async function paint(canvasIn, canvasOut, f, sc) {
+  const im = await img(f); const rec = trackAt(f), gt = gts.get(f);
+  if (canvasIn) { const c = canvasIn.getContext('2d'); c.drawImage(im, 0, 0, canvasIn.width, canvasIn.height); const L = meta.calibration.count_line_x * sc; c.strokeStyle = '#0cf'; c.setLineDash([4, 3]); c.beginPath(); c.moveTo(L, 0); c.lineTo(L, canvasIn.height); c.stroke(); c.setLineDash([]); }
+  const c = canvasOut.getContext('2d'); c.drawImage(im, 0, 0, canvasOut.width, canvasOut.height); overlay(c, rec, gt, sc);
+}
+
+async function goto(f) {
+  f = Math.max(0, Math.min(N - 1, Math.round(f))); cur = f;
+  await ensureChunk(f); if (f % CH > CH - 40) ensureChunk(f + CH); if (f % CH < 40 && f >= CH) ensureChunk(f - CH);
+  $('slider').value = f; $('fno').textContent = f; $('ftime').textContent = (f / FPS).toFixed(2);
+  const rec = trackAt(f); $('fv').textContent = rec ? rec.v : '–';
+  await paint($('cin'), $('cout'), f, 1);
+  tables(f, rec); strip(f); drawChart();
+}
+function tables(f, rec) {
+  const gc = [0, 0, 0, 0]; M.gt_crossings.forEach(c => { if (c[0] <= f) { gc[0]++; gc[1 + c[1]]++; } });
+  const pc = rec ? rec.cnt : [0, 0, 0, 0]; const dif = i => pc[i] - gc[i];
+  $('cnt').innerHTML = '<tr><th></th><th>total</th>' + BN.map(b => `<th>${b}</th>`).join('') + '</tr>' +
+    `<tr><td class="l">pipeline count</td>${pc.map(x => `<td>${x}</td>`).join('')}</tr><tr><td class="l">true count (crossed line)</td>${gc.map(x => `<td>${x}</td>`).join('')}</tr>` +
+    `<tr><td class="l">difference</td>${[0, 1, 2, 3].map(i => `<td class="${dif(i) ? 'bad' : 'good'}">${dif(i) > 0 ? '+' : ''}${dif(i)}</td>`).join('')}</tr>`;
+  const ST = ['matched', 'merged (coasting)', 'missed (coasting)', 'tentative'];
+  $('trk').innerHTML = '<tr><th>id</th><th class="l">state</th><th>box x,y</th><th>w×h</th><th>bucket</th><th>counted</th></tr>' + (rec ? rec.tr.filter(t => t[1] < 700).map(t => `<tr><td>#${t[0]}</td><td class="l">${ST[t[5]]}</td><td>${t[1].toFixed(0)},${t[2].toFixed(0)}</td><td>${t[3].toFixed(0)}×${t[4].toFixed(0)}</td><td>${BN[bucketOf(t[3], t[4])]}</td><td>${t[6] ? '✓' : ''}</td></tr>`).join('') : '');
+}
+async function strip(f) {
+  const step = +$('sstep').value, el = $('strip'); const fr = [-3, -2, -1, 0, 1, 2, 3].map(k => f + k * step);
+  if (el.children.length !== 7) { el.innerHTML = fr.map((_, i) => `<figure><canvas width="320" height="100"></canvas><figcaption></figcaption></figure>`).join(''); [...el.children].forEach((fg, i) => fg.firstElementChild.onclick = () => goto(+fg.dataset.f)); }
+  for (let i = 0; i < 7; i++) {
+    const fg = el.children[i], t = fr[i]; fg.dataset.f = t; fg.firstElementChild.style.outline = i === 3 ? '3px solid #0a0' : 'none';
+    if (t < 0 || t >= N) { fg.lastElementChild.textContent = '–'; continue; }
+    await ensureChunk(t); fg.lastElementChild.textContent = 'frame ' + t; await paint(null, fg.firstElementChild, t, 0.5);
+  }
+}
+function drawChart() {
+  if (!M) return; const cv = $('cchart'), c = cv.getContext('2d'), W = cv.width, H = cv.height, T = M.timeline, k = T.step;
+  c.clearRect(0, 0, W, H); const x = f => f / N * W;
+  M.gt_phases.forEach(p => { if (p.mode === 'surge') { c.fillStyle = '#e4e4e4'; c.fillRect(x(p.start), 0, x(p.end) - x(p.start), H); } });
+  M.gt_stalls.forEach(s => { c.fillStyle = 'rgba(220,40,40,.5)'; c.fillRect(x(s[0]), 0, Math.max(2, x(s[1]) - x(s[0])), H); });
+  const d = T.pred.map((v, i) => v - T.gt[i]); const mx = Math.max(3, ...d.map(Math.abs)); const y = v => H / 2 - v / mx * (H / 2 - 12);
+  c.strokeStyle = '#999'; c.beginPath(); c.moveTo(0, y(0)); c.lineTo(W, y(0)); c.stroke();
+  c.strokeStyle = '#06c'; c.lineWidth = 1.5; c.beginPath(); d.forEach((v, i) => { const xx = x(i * k), yy = y(v); i ? c.lineTo(xx, yy) : c.moveTo(xx, yy); }); c.stroke();
+  c.fillStyle = '#b00020'; M.discrepancies.forEach(q => c.fillRect(x(q.frame) - 1, H - 10, 2, 10));
+  c.fillStyle = '#333'; c.font = '10px sans-serif'; c.fillText('+' + mx, 2, 10); c.fillText('−' + mx, 2, H - 12);
+  c.strokeStyle = '#0a0'; c.lineWidth = 2; c.beginPath(); c.moveTo(x(cur), 0); c.lineTo(x(cur), H); c.stroke();
+}
+
+// ---- controls
+function play() {
+  playing = !playing; $('bplay').textContent = playing ? '❚❚ Pause' : '▶ Play'; clearTimeout(timer);
+  const tick = async () => { if (!playing) return; const t0 = performance.now(); if (cur >= N - 1) { playing = false; $('bplay').textContent = '▶ Play'; return; } await goto(cur + 1); timer = setTimeout(tick, Math.max(0, 1000 / FPS / +$('spd').value - (performance.now() - t0))); };
+  if (playing) tick();
+}
+$('bplay').onclick = play;
+[['b-10', -10], ['b-1', -1], ['b+1', 1], ['b+10', 10]].forEach(([id, d]) => $(id).onclick = () => { playing && play(); goto(cur + d); });
+$('slider').oninput = e => goto(+e.target.value);
+$('jnext').onclick = () => jump(1); $('jprev').onclick = () => jump(-1);
+['o-gt', 'o-pred', 'o-blob', 'sstep'].forEach(id => $(id).onchange = () => goto(cur));
+$('cchart').onclick = e => { const r = e.target.getBoundingClientRect(); goto((e.clientX - r.left) / r.width * N); };
+document.onkeydown = e => { if (e.target.tagName === 'INPUT' && e.target.type !== 'range' && e.target.type !== 'checkbox') return; if (e.key === 'ArrowRight') goto(cur + 1); else if (e.key === 'ArrowLeft') goto(cur - 1); else if (e.key === ' ') { e.preventDefault(); play(); } };
+$('runsel').onchange = async () => { run = $('runsel').value; $('runin').value = run; await loadRun(); };
+async function start(gen) {
+  const body = { run: $('runin').value || 'default', seed: +$('seed').value, duration: +$('dur').value, stride: +$('stride').value, generate: gen };
+  const r = await fetch('/api/run', { method: 'POST', body: JSON.stringify(body) });
+  if (r.status === 409) alert('A job is already running.'); else { $('runsel').dataset.loaded = ''; M = null; }
+}
+$('bgen').onclick = () => start(true); $('btrk').onclick = () => start(false);
+if (location.protocol === 'file:') $('nofile').style.display = ''; else if (location.protocol === 'file:') $('nofile').style.display = ''; else poll();
+</script>
+</body>
+</html>
